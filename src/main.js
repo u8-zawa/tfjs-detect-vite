@@ -1,3 +1,6 @@
+import { FPS_UPDATE_INTERVAL } from './config.js';
+import { drawBoundingBox } from './utils.js';
+
 // --- DOM要素の取得 ---
 const elements = {
   video: document.getElementById('webcam'),
@@ -6,24 +9,26 @@ const elements = {
   main: document.getElementById('main'),
   errorMessage: document.getElementById('error-message'),
   fpsCounter: document.getElementById('fps-counter'),
-  detectionToggle: document.getElementById('detection-toggle'),
+  detection: document.getElementById('detection-toggle'),
   progressBar: document.getElementById('progress-bar')
 };
 const ctx = elements.canvas.getContext('2d');
 
-// --- グローバル変数 ---
-let isDetectionActive = true;
-let animationFrameId = null;
-let lastFrameTime = 0;
-const frameSkip = 2;
-let frameCount = 0;
+// --- 状態管理 ---
+const state = {
+  isDetectionEnabled: true,
+  loopController: null,
+  lastFrameTime: 0,
+  frameCount: 0,
+  isCameraReady: false,
+  isWorkerReady: false,
+  detectionWorker: null,
+};
 
-// 状態管理フラグ
-let isCameraReady = false;
-let isWorkerReady = false;
+const frameSkip = 2; // フレームスキップは定数として維持
 
 // Web Workerを初期化
-const detectionWorker = new Worker(new URL('./detection.worker.js', import.meta.url), {
+state.detectionWorker = new Worker(new URL('./detection.worker.js', import.meta.url), {
   type: 'module'
 });
 
@@ -34,15 +39,14 @@ async function initialize() {
     setupEventListeners();
 
     // Workerに初期化メッセージを送信
-    detectionWorker.postMessage({ type: 'init', payload: { backend: 'webgl' } });
+    state.detectionWorker.postMessage({ type: 'init' });
 
     // カメラのセットアップ
     await setupCamera();
-    isCameraReady = true;
+    state.isCameraReady = true;
 
-    // requestAnimationFrame は常に動かし続ける
-    lastFrameTime = performance.now();
-    requestAnimationFrame(gameLoop);
+    // ループを開始
+    startLoop();
 
   } catch (error) {
     // 具体的なエラーメッセージを提供
@@ -55,17 +59,17 @@ async function initialize() {
 }
 
 // --- Workerからのメッセージを処理 ---
-detectionWorker.onmessage = (event) => {
+state.detectionWorker.onmessage = (event) => {
   const { type, payload } = event.data;
 
   switch (type) {
     case 'ready':
-      isWorkerReady = true;
+      state.isWorkerReady = true;
       elements.loading.classList.add('hidden');
       elements.main.classList.remove('hidden');
       break;
-    case 'detectionResult':
-      renderPredictions(payload.predictions);
+    case 'result':
+      renderPredictions(payload);
       break;
     case 'error':
       showError(payload.message);
@@ -142,105 +146,95 @@ async function setupCamera() {
 
 // --- UIイベントリスナー ---
 function setupEventListeners() {
-  elements.detectionToggle.addEventListener('change', (e) => {
-    isDetectionActive = e.target.checked;
-    if (!isDetectionActive) {
-      ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
+  elements.detection.addEventListener('change', (event) => {
+    state.isDetectionEnabled = event.target.checked;
+    if (state.isDetectionEnabled) {
+      startLoop();
+    } else {
+      stopLoop();
     }
   });
+}
+
+// --- ループ制御 ---
+function startLoop() {
+  if (state.loopController) state.loopController.abort(); // 既存のループを停止
+  state.loopController = new AbortController();
+  const signal = state.loopController.signal;
+
+  const loop = (timestamp) => {
+    if (signal.aborted) return;
+    gameLoop(timestamp);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+
+function stopLoop() {
+  if (state.loopController) {
+    state.loopController.abort();
+    state.loopController = null;
+  }
+  // キャンバスをクリア
+  ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
 }
 
 // --- ループ関数 ---
 async function gameLoop() {
   // 早期return による条件チェック（ガード節）
-  if (!isCameraReady) {
-    frameCount++;
+  if (!state.isCameraReady || !state.isWorkerReady || elements.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || elements.video.videoWidth <= 0 || elements.video.videoHeight <= 0) {
     calculateFPS();
-    animationFrameId = requestAnimationFrame(gameLoop);
     return;
   }
-  
-  if (!isWorkerReady) {
-    frameCount++;
+
+  if (state.frameCount % frameSkip !== 0) {
+    state.frameCount++;
     calculateFPS();
-    animationFrameId = requestAnimationFrame(gameLoop);
-    return;
-  }
-  
-  if (!isDetectionActive) {
-    frameCount++;
-    calculateFPS();
-    animationFrameId = requestAnimationFrame(gameLoop);
-    return;
-  }
-  
-  if (elements.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    frameCount++;
-    calculateFPS();
-    animationFrameId = requestAnimationFrame(gameLoop);
-    return;
-  }
-  
-  if (elements.video.videoWidth <= 0 || elements.video.videoHeight <= 0) {
-    frameCount++;
-    calculateFPS();
-    animationFrameId = requestAnimationFrame(gameLoop);
-    return;
-  }
-  
-  if (frameCount % frameSkip !== 0) {
-    frameCount++;
-    calculateFPS();
-    animationFrameId = requestAnimationFrame(gameLoop);
     return;
   }
 
   // メインの検出処理（ネストなし）
   try {
     const frame = await createImageBitmap(elements.video);
-    detectionWorker.postMessage({ type: 'detect', payload: { frame } }, [frame]);
+    state.detectionWorker.postMessage({ type: 'predict', payload: frame }, [frame]);
   } catch (e) {
     // このエラーはタブが非アクティブな場合などに発生するため、警告としてログ出力
     console.warn("フレーム処理エラー:", e.message, "- フレームをスキップします");
   }
 
-  frameCount++;
+  state.frameCount++;
   calculateFPS();
-  animationFrameId = requestAnimationFrame(gameLoop);
 }
 
 // --- 検出結果の描画 ---
 function renderPredictions(predictions) {
   ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
-  ctx.font = '16px Arial';
-  ctx.textBaseline = 'top';
-
   predictions.forEach(prediction => {
     // 早期return によるスコア閾値チェック
     if (prediction.score < 0.5) return;
 
     const [x, y, width, height] = prediction.bbox;
     const label = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
-
-    ctx.strokeStyle = '#00FFFF';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x, y, width, height);
-
-    ctx.fillStyle = '#00FFFF';
-    const textWidth = ctx.measureText(label).width;
-    ctx.fillRect(x, y, textWidth + 8, 20);
-
-    ctx.fillStyle = '#000000';
-    ctx.fillText(label, x + 4, y + 2);
+    drawBoundingBox(ctx, x, y, width, height, label);
   });
 }
 
 // --- FPSカウンター ---
+let lastFpsUpdateTime = 0;
 function calculateFPS() {
   const now = performance.now();
-  const delta = (now - lastFrameTime) / 1000;
-  lastFrameTime = now;
-  elements.fpsCounter.textContent = (1 / delta).toFixed(1);
+  if (!state.lastFrameTime) {
+    state.lastFrameTime = now;
+  }
+  const delta = now - state.lastFrameTime;
+  state.lastFrameTime = now;
+  const fps = 1000 / delta;
+
+  // UIの更新を間引く
+  if (now - lastFpsUpdateTime > FPS_UPDATE_INTERVAL) {
+    elements.fpsCounter.textContent = fps.toFixed(1);
+    lastFpsUpdateTime = now;
+  }
 }
 
 // --- アプリケーションの開始 ---

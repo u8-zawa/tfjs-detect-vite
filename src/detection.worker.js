@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
+import { SCORE_THRESHOLD, MODEL_CONFIG } from './config.js';
 
 let model = null;
 let isReady = false;
@@ -15,57 +16,53 @@ function handleWorkerError(error, context = 'Worker') {
 
 // メインスレッドからのメッセージを受け取るリスナー
 self.onmessage = async (event) => {
+    const { type, payload } = event.data;
     try {
-        const { type, payload } = event.data;
+        switch (type) {
+            case 'init':
+                await initialize();
+                break;
+            case 'predict':
+                if (isReady && payload) {
+                    // imageDataからテンソルを作成
+                    const tensor = tf.browser.fromPixels(payload);
 
-        if (type === 'init') {
-            await initialize(payload.backend);
-        } else if (type === 'detect' && isReady) {
-            detectObjects(payload.frame);
+                    try {
+                        // モデルで物体を検出 (非同期処理の完了を待つ)
+                        const predictions = await model.detect(tensor, undefined, SCORE_THRESHOLD);
+
+                        // 検出結果をメインスレッドに送信
+                        self.postMessage({ type: 'result', payload: predictions });
+
+                    } catch (error) {
+                        console.error("物体検出エラー:", error.message, "- 検出をスキップします");
+                    } finally {
+                        // try...finally を使うことで、成功・失敗に関わらずメモリを確実に解放
+                        tensor.dispose();
+                        // ImageBitmapはWorkerが所有権を持つので、使い終わったら閉じる
+                        payload.close();
+                    }
+                }
+                break;
         }
     } catch (error) {
-        handleWorkerError(error, 'メッセージ処理');
+        handleWorkerError(error, `メッセージ[${type}]の処理`);
     }
 };
 
 // Workerの初期化関数
-async function initialize(backend) {
+async function initialize() {
     try {
-        await tf.setBackend(backend);
+        // WebGLバックエンドを設定
+        await tf.setBackend('webgl');
         await tf.ready();
 
-        model = await cocoSsd.load();
+        model = await cocoSsd.load(MODEL_CONFIG);
 
         isReady = true;
         self.postMessage({ type: 'ready' });
 
     } catch (error) {
         handleWorkerError(error, 'Worker初期化');
-    }
-}
-
-// 物体検出を実行する関数
-async function detectObjects(frame) {
-    if (!model || !frame) {
-        return;
-    }
-
-    // imageDataからテンソルを作成
-    const tensor = tf.browser.fromPixels(frame);
-
-    try {
-        // モデルで物体を検出 (非同期処理の完了を待つ)
-        const predictions = await model.detect(tensor);
-
-        // 検出結果をメインスレッドに送信
-        self.postMessage({ type: 'detectionResult', payload: { predictions } });
-
-    } catch (error) {
-        console.error("物体検出エラー:", error.message, "- 検出をスキップします");
-    } finally {
-        // try...finally を使うことで、成功・失敗に関わらずメモリを確実に解放
-        tensor.dispose();
-        // ImageBitmapはWorkerが所有権を持つので、使い終わったら閉じる
-        frame.close();
     }
 }
