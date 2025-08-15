@@ -1,13 +1,15 @@
 // --- DOM要素の取得 ---
-const video = document.getElementById('webcam');
-const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d');
-const loadingStatus = document.getElementById('loading');
-const mainContent = document.getElementById('main');
-const errorMessage = document.getElementById('error-message');
-const fpsCounter = document.getElementById('fps-counter');
-const detectionToggle = document.getElementById('detection-toggle');
-const progressBar = document.getElementById('progress-bar');
+const elements = {
+  video: document.getElementById('webcam'),
+  canvas: document.getElementById('canvas'),
+  loading: document.getElementById('loading'),
+  main: document.getElementById('main'),
+  errorMessage: document.getElementById('error-message'),
+  fpsCounter: document.getElementById('fps-counter'),
+  detectionToggle: document.getElementById('detection-toggle'),
+  progressBar: document.getElementById('progress-bar')
+};
+const ctx = elements.canvas.getContext('2d');
 
 // --- グローバル変数 ---
 let isDetectionActive = true;
@@ -43,8 +45,12 @@ async function initialize() {
     requestAnimationFrame(gameLoop);
 
   } catch (error) {
-    console.error("Initialization failed:", error);
-    showError("初期化に失敗しました。カメラのアクセス権限を確認するか、ページをリフレッシュしてください。");
+    // 具体的なエラーメッセージを提供
+    const errorMessage = error.message.includes('MediaDevices') || error.message.includes('getUserMedia')
+      ? '初期化に失敗しました。カメラのアクセス権限を確認するか、ページをリフレッシュしてください。'
+      : error.message;
+    showError(errorMessage);
+    console.error('初期化エラー:', error);
   }
 }
 
@@ -55,8 +61,8 @@ detectionWorker.onmessage = (event) => {
   switch (type) {
     case 'ready':
       isWorkerReady = true;
-      loadingStatus.classList.add('hidden');
-      mainContent.classList.remove('hidden');
+      elements.loading.classList.add('hidden');
+      elements.main.classList.remove('hidden');
       break;
     case 'detectionResult':
       renderPredictions(payload.predictions);
@@ -67,68 +73,135 @@ detectionWorker.onmessage = (event) => {
   }
 };
 
+// --- 共通エラーハンドラー ---
+function handleError(error, context = 'アプリケーション') {
+  console.error(`${context}エラー:`, error);
+  const message = error.message || 'エラーが発生しました';
+  showError(`エラー: ${message}`);
+}
+
 // --- エラー表示 ---
 function showError(message) {
-  errorMessage.textContent = message;
-  errorMessage.classList.remove('hidden');
-  loadingStatus.classList.add('hidden');
-  mainContent.classList.add('hidden');
+  elements.errorMessage.textContent = message;
+  elements.errorMessage.classList.remove('hidden');
+  elements.loading.classList.add('hidden');
+  elements.main.classList.add('hidden');
 }
 
 // --- カメラのセットアップ ---
 async function setupCamera() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error("このブラウザはカメラAPIをサポートしていません。");
+  try {
+    // 早期return によるブラウザサポートチェック
+    if (!navigator.mediaDevices) {
+      throw new Error("このブラウザはMediaDevices APIをサポートしていません。");
+    }
+    
+    if (!navigator.mediaDevices.getUserMedia) {
+      throw new Error("このブラウザはgetUserMedia APIをサポートしていません。");
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      'audio': false,
+      'video': {
+        facingMode: 'environment',
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      },
+    });
+    
+    // ストリーム取得の早期チェック
+    if (!stream) {
+      throw new Error("カメラストリームの取得に失敗しました。");
+    }
+    
+    elements.video.srcObject = stream;
+
+    return new Promise((resolve, reject) => {
+      elements.video.onloadedmetadata = () => {
+        // ビデオサイズの早期チェック
+        if (elements.video.videoWidth === 0 || elements.video.videoHeight === 0) {
+          reject(new Error("無効なビデオサイズが検出されました。"));
+          return;
+        }
+        
+        elements.canvas.width = elements.video.videoWidth;
+        elements.canvas.height = elements.video.videoHeight;
+        resolve(elements.video);
+      };
+      
+      // タイムアウト処理を追加
+      elements.video.onerror = () => {
+        reject(new Error("ビデオの読み込みでエラーが発生しました。"));
+      };
+    });
+  } catch (error) {
+    handleError(error, 'カメラセットアップ');
+    throw error; // 上位のinitialize()でキャッチされるため再スロー
   }
-
-  const stream = await navigator.mediaDevices.getUserMedia({
-    'audio': false,
-    'video': {
-      facingMode: 'environment',
-      width: { ideal: 640 },
-      height: { ideal: 480 }
-    },
-  });
-  video.srcObject = stream;
-
-  return new Promise((resolve) => {
-    video.onloadedmetadata = () => {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      resolve(video);
-    };
-  });
 }
 
 // --- UIイベントリスナー ---
 function setupEventListeners() {
-  detectionToggle.addEventListener('change', (e) => {
+  elements.detectionToggle.addEventListener('change', (e) => {
     isDetectionActive = e.target.checked;
     if (!isDetectionActive) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
     }
   });
 }
 
 // --- ループ関数 ---
 async function gameLoop() {
-  // すべての準備が整っているか、より厳密にチェック
-  const canDetect =
-    isCameraReady &&
-    isWorkerReady &&
-    isDetectionActive &&
-    video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
-    video.videoWidth > 0 &&
-    video.videoHeight > 0;
+  // 早期return による条件チェック（ガード節）
+  if (!isCameraReady) {
+    frameCount++;
+    calculateFPS();
+    animationFrameId = requestAnimationFrame(gameLoop);
+    return;
+  }
+  
+  if (!isWorkerReady) {
+    frameCount++;
+    calculateFPS();
+    animationFrameId = requestAnimationFrame(gameLoop);
+    return;
+  }
+  
+  if (!isDetectionActive) {
+    frameCount++;
+    calculateFPS();
+    animationFrameId = requestAnimationFrame(gameLoop);
+    return;
+  }
+  
+  if (elements.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    frameCount++;
+    calculateFPS();
+    animationFrameId = requestAnimationFrame(gameLoop);
+    return;
+  }
+  
+  if (elements.video.videoWidth <= 0 || elements.video.videoHeight <= 0) {
+    frameCount++;
+    calculateFPS();
+    animationFrameId = requestAnimationFrame(gameLoop);
+    return;
+  }
+  
+  if (frameCount % frameSkip !== 0) {
+    frameCount++;
+    calculateFPS();
+    animationFrameId = requestAnimationFrame(gameLoop);
+    return;
+  }
 
-  if (canDetect && frameCount % frameSkip === 0) {
-    try {
-      const frame = await createImageBitmap(video);
-      detectionWorker.postMessage({ type: 'detect', payload: { frame } }, [frame]);
-    } catch (e) {
-      // このエラーはタブが非アクティブな場合などに発生するため、警告としてログ出力
-      console.warn("Frame creation failed, skipping this frame:", e.message);
-    }
+  // メインの検出処理（ネストなし）
+  try {
+    const frame = await createImageBitmap(elements.video);
+    detectionWorker.postMessage({ type: 'detect', payload: { frame } }, [frame]);
+  } catch (e) {
+    // このエラーはタブが非アクティブな場合などに発生するため、警告としてログ出力
+    console.warn("フレーム処理エラー:", e.message, "- フレームをスキップします");
   }
 
   frameCount++;
@@ -138,11 +211,14 @@ async function gameLoop() {
 
 // --- 検出結果の描画 ---
 function renderPredictions(predictions) {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
   ctx.font = '16px Arial';
   ctx.textBaseline = 'top';
 
   predictions.forEach(prediction => {
+    // 早期return によるスコア閾値チェック
+    if (prediction.score < 0.5) return;
+
     const [x, y, width, height] = prediction.bbox;
     const label = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
 
@@ -164,7 +240,7 @@ function calculateFPS() {
   const now = performance.now();
   const delta = (now - lastFrameTime) / 1000;
   lastFrameTime = now;
-  fpsCounter.textContent = (1 / delta).toFixed(1);
+  elements.fpsCounter.textContent = (1 / delta).toFixed(1);
 }
 
 // --- アプリケーションの開始 ---

@@ -4,14 +4,27 @@ import * as cocoSsd from '@tensorflow-models/coco-ssd';
 let model = null;
 let isReady = false;
 
+// --- Worker共通エラーハンドラー ---
+function handleWorkerError(error, context = 'Worker') {
+    console.error(`${context}エラー:`, error);
+    self.postMessage({
+        type: 'error',
+        payload: { message: error.message || 'Worker内でエラーが発生しました' }
+    });
+}
+
 // メインスレッドからのメッセージを受け取るリスナー
 self.onmessage = async (event) => {
-    const { type, payload } = event.data;
+    try {
+        const { type, payload } = event.data;
 
-    if (type === 'init') {
-        await initialize(payload.backend);
-    } else if (type === 'detect' && isReady) {
-        detectObjects(payload.frame);
+        if (type === 'init') {
+            await initialize(payload.backend);
+        } else if (type === 'detect' && isReady) {
+            detectObjects(payload.frame);
+        }
+    } catch (error) {
+        handleWorkerError(error, 'メッセージ処理');
     }
 };
 
@@ -27,8 +40,7 @@ async function initialize(backend) {
         self.postMessage({ type: 'ready' });
 
     } catch (error) {
-        console.error("Worker initialization failed:", error);
-        self.postMessage({ type: 'error', payload: { message: 'モデルの読み込みに失敗しました。' } });
+        handleWorkerError(error, 'Worker初期化');
     }
 }
 
@@ -48,8 +60,8 @@ async function detectObjects(frame) {
         // 検出結果をメインスレッドに送信
         self.postMessage({ type: 'detectionResult', payload: { predictions } });
 
-    } catch (e) {
-        console.error("Detection failed:", e);
+    } catch (error) {
+        console.error("物体検出エラー:", error.message, "- 検出をスキップします");
     } finally {
         // try...finally を使うことで、成功・失敗に関わらずメモリを確実に解放
         tensor.dispose();
